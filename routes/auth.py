@@ -1,9 +1,8 @@
 """
 文芽 - 认证路由
 """
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request
 from flask_login import login_user, logout_user, login_required, current_user
-from werkzeug.security import generate_password_hash
 from datetime import datetime, timedelta
 import random
 import string
@@ -22,29 +21,18 @@ from services.content_safe import ContentSafeService
 
 auth_bp = Blueprint('auth', __name__)
 
-# 临时存储验证码（生产环境应使用 Redis）
-verification_codes = {}
-
-CODE_EXPIRE_MINUTES = 5
-
-
-def generate_verification_code(length=6):
-    """生成验证码"""
-    return ''.join(random.choices(string.digits, k=length))
-
-
-def cleanup_expired_codes():
-    """清理过期验证码"""
-    now = datetime.utcnow()
-    expired_keys = [k for k, v in verification_codes.items() if v['expires_at'] < now]
-    for k in expired_keys:
-        del verification_codes[k]
+def generate_guardian_phone():
+    """生成系统占位监护人手机号（当注册未提供手机号时使用）"""
+    while True:
+        phone = '199' + ''.join(random.choices(string.digits, k=8))
+        if not Guardian.query.filter_by(phone=phone).first():
+            return phone
 
 
 @auth_bp.route('/register', methods=['POST'])
 @limiter.limit("5 per hour")
 def register():
-    """用户注册（需监护人同意验证）"""
+    """用户注册（无需手机验证码）"""
     data = request.get_json()
     if not data:
         return error_response('Invalid request', status_code=400)
@@ -57,7 +45,6 @@ def register():
     guardian_name = (data.get('guardian_name') or '').strip()
     guardian_phone = (data.get('guardian_phone') or '').strip()
     guardian_relationship = data.get('guardian_relationship') or ''
-    guardian_verification_code = data.get('guardian_verification_code') or ''
 
     # 字段校验
     ok, msg = validate_username(username)
@@ -72,15 +59,18 @@ def register():
     if not ok:
         return error_response(msg, status_code=400)
 
-    ok, msg = validate_phone(guardian_phone)
-    if not ok:
-        return error_response(msg, status_code=400)
-
     if not guardian_name:
         return error_response('监护人姓名不能为空', status_code=400)
 
     if User.query.filter_by(username=username).first():
         return error_response('用户名已存在', status_code=409)
+
+    if guardian_phone:
+        ok, msg = validate_phone(guardian_phone)
+        if not ok:
+            return error_response(msg, status_code=400)
+    else:
+        guardian_phone = generate_guardian_phone()
 
     # 解析出生日期
     birth_date = None
@@ -90,22 +80,6 @@ def register():
         except ValueError:
             return error_response('出生日期格式无效', status_code=400)
 
-    # 清理过期验证码
-    cleanup_expired_codes()
-
-    # 验证监护人验证码
-    guardian_key = f"guardian:{guardian_phone}"
-    stored = verification_codes.get(guardian_key)
-    if not stored:
-        return error_response('验证码未发送或已过期，请重新获取', status_code=400)
-
-    if stored['expires_at'] < datetime.utcnow():
-        del verification_codes[guardian_key]
-        return error_response('验证码已过期，请重新获取', status_code=400)
-
-    if guardian_verification_code != stored['code']:
-        return error_response('验证码错误', status_code=400)
-
     # 创建监护人
     guardian = Guardian(
         name=guardian_name,
@@ -113,7 +87,7 @@ def register():
         relationship=guardian_relationship,
         is_verified=True,
         verified_at=datetime.utcnow(),
-        verification_method='sms',
+        verification_method='none',
         consent_given_at=datetime.utcnow(),
         consent_expires_at=datetime.utcnow() + timedelta(days=365 * 3)
     )
@@ -142,16 +116,13 @@ def register():
     compliance_log = ComplianceLog(
         log_type='guardian_consent',
         user_id=user.id,
-        action='guardian_verification_completed',
+        action='guardian_consent_completed',
         details={'guardian_name': guardian_name, 'guardian_phone': guardian_phone},
         ip_address=get_client_ip()
     )
     db.session.add(compliance_log)
 
     db.session.commit()
-
-    # 清理验证码
-    del verification_codes[guardian_key]
 
     login_user(user)
 
@@ -327,44 +298,6 @@ def export_data():
     db.session.commit()
 
     return success_response(export, message='数据导出成功')
-
-
-@auth_bp.route('/send-guardian-code', methods=['POST'])
-@limiter.limit("3 per hour")
-def send_guardian_code():
-    """发送监护人验证码"""
-    data = request.get_json()
-    if not data:
-        return error_response('Invalid request', status_code=400)
-
-    phone = (data.get('phone') or '').strip()
-
-    ok, msg = validate_phone(phone)
-    if not ok:
-        return error_response(msg, status_code=400)
-
-    # 清理过期验证码
-    cleanup_expired_codes()
-
-    code = generate_verification_code()
-
-    verification_codes[f"guardian:{phone}"] = {
-        'code': code,
-        'expires_at': datetime.utcnow() + timedelta(minutes=CODE_EXPIRE_MINUTES)
-    }
-
-    current_app.logger.info(f"监护人验证码 [{phone}]: {code}")
-
-    compliance_log = ComplianceLog(
-        log_type='guardian_consent',
-        action='verification_code_sent',
-        details={'phone': phone},
-        ip_address=get_client_ip()
-    )
-    db.session.add(compliance_log)
-    db.session.commit()
-
-    return success_response(message='验证码已发送')
 
 
 @auth_bp.route('/me', methods=['GET'])
