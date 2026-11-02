@@ -1,20 +1,132 @@
 """
 文芽 - 认证路由
 """
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request
 from flask_login import login_user, logout_user, login_required, current_user
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
+import random
+import string
 
 from app import db, limiter
-from models.user import User, UserProfile
+from models.user import User, Guardian, UserProfile
+from models.ai_memory import AIMemory
 from models.writing import Writing
 from models.compliance import ComplianceLog
-from utils.validators import validate_password, validate_grade
+from utils.validators import (
+    validate_username, validate_password, validate_phone, validate_grade
+)
 from utils.response import success_response, error_response
 from utils.helpers import get_client_ip
 from services.content_safe import ContentSafeService
 
 auth_bp = Blueprint('auth', __name__)
+
+def generate_guardian_phone():
+    """生成系统占位监护人手机号（当注册未提供手机号时使用）"""
+    while True:
+        phone = '199' + ''.join(random.choices(string.digits, k=8))
+        if not Guardian.query.filter_by(phone=phone).first():
+            return phone
+
+
+@auth_bp.route('/register', methods=['POST'])
+@limiter.limit("5 per hour")
+def register():
+    """用户注册（无需手机验证码）"""
+    data = request.get_json()
+    if not data:
+        return error_response('Invalid request', status_code=400)
+
+    username = (data.get('username') or '').strip()
+    password = data.get('password') or ''
+    grade = data.get('grade')
+    birth_date_str = data.get('birth_date')
+
+    guardian_name = (data.get('guardian_name') or '').strip()
+    guardian_phone = (data.get('guardian_phone') or '').strip()
+    guardian_relationship = data.get('guardian_relationship') or ''
+
+    # 字段校验
+    ok, msg = validate_username(username)
+    if not ok:
+        return error_response(msg, status_code=400)
+
+    ok, msg = validate_password(password)
+    if not ok:
+        return error_response(msg, status_code=400)
+
+    ok, msg = validate_grade(grade)
+    if not ok:
+        return error_response(msg, status_code=400)
+
+    if not guardian_name:
+        return error_response('监护人姓名不能为空', status_code=400)
+
+    if User.query.filter_by(username=username).first():
+        return error_response('用户名已存在', status_code=409)
+
+    if guardian_phone:
+        ok, msg = validate_phone(guardian_phone)
+        if not ok:
+            return error_response(msg, status_code=400)
+    else:
+        guardian_phone = generate_guardian_phone()
+
+    # 解析出生日期
+    birth_date = None
+    if birth_date_str:
+        try:
+            birth_date = datetime.strptime(birth_date_str, '%Y-%m-%d').date()
+        except ValueError:
+            return error_response('出生日期格式无效', status_code=400)
+
+    # 创建监护人
+    guardian = Guardian(
+        name=guardian_name,
+        phone=guardian_phone,
+        relationship=guardian_relationship,
+        is_verified=True,
+        verified_at=datetime.utcnow(),
+        verification_method='none',
+        consent_given_at=datetime.utcnow(),
+        consent_expires_at=datetime.utcnow() + timedelta(days=365 * 3)
+    )
+    db.session.add(guardian)
+    db.session.flush()
+
+    # 创建用户
+    user = User(
+        username=username,
+        grade=grade,
+        birth_date=birth_date,
+        is_guardian_verified=True,
+        guardian_id=guardian.id
+    )
+    user.set_password(password)
+    db.session.add(user)
+    db.session.flush()
+
+    # 创建用户画像 & AI 记忆
+    profile = UserProfile(user_id=user.id)
+    ai_memory = AIMemory(user_id=user.id)
+    db.session.add(profile)
+    db.session.add(ai_memory)
+
+    # 合规日志
+    compliance_log = ComplianceLog(
+        log_type='guardian_consent',
+        user_id=user.id,
+        action='guardian_consent_completed',
+        details={'guardian_name': guardian_name, 'guardian_phone': guardian_phone},
+        ip_address=get_client_ip()
+    )
+    db.session.add(compliance_log)
+
+    db.session.commit()
+
+    login_user(user)
+
+    return success_response({'user': user.to_dict()}, message='注册成功', status_code=201)
 
 
 @auth_bp.route('/login', methods=['POST'])
@@ -39,7 +151,7 @@ def login():
     if not user.is_active:
         return error_response('账号已被停用', status_code=403)
 
-    user.last_login_at = datetime.now(timezone.utc)
+    user.last_login_at = datetime.utcnow()
     db.session.commit()
 
     login_user(user, remember=bool(data.get('remember', False)))
@@ -173,7 +285,7 @@ def export_data():
         'user': current_user.to_dict(),
         'profile': profile.to_dict() if profile else None,
         'writings': [w.to_dict(include_content=True, include_scores=True) for w in writings],
-        'exported_at': datetime.now(timezone.utc).isoformat()
+        'exported_at': datetime.utcnow().isoformat()
     }
 
     compliance_log = ComplianceLog(
